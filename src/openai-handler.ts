@@ -79,6 +79,21 @@ function stringifyUnknownContent(value: unknown): string {
     }
 }
 
+function isCriticalResponsesSystemPrompt(content: string): boolean {
+    const normalized = content.toLowerCase();
+    const criticalMarkers = [
+        'you are a coding agent running in the codex cli',
+        'codex cli is an open source project led by openai',
+        'you are expected to be precise, safe, and helpful',
+        '<permissions instructions>',
+        '<collaboration_mode>',
+        'sandbox_mode',
+        'danger-full-access',
+        'do not stop early',
+    ];
+    return criticalMarkers.some(marker => normalized.includes(marker));
+}
+
 function unsupportedImageFileError(fileId?: string): OpenAIRequestError {
     const suffix = fileId ? ` (file_id: ${fileId})` : '';
     return new OpenAIRequestError(
@@ -87,6 +102,76 @@ function unsupportedImageFileError(fileId?: string): OpenAIRequestError {
         'invalid_request_error',
         'unsupported_content_part'
     );
+}
+
+function isPlanningOnlyNoAction(text: string): boolean {
+    const trimmed = (text || '').trim();
+    if (!trimmed) return false;
+    if (hasToolCalls(trimmed)) return false;
+
+    // 典型“先计划后不执行”起手句，且文本较短时判定为非执行响应。
+    const planningLeadPatterns: RegExp[] = [
+        /^我先(?:看|查|检查|定位|确认|分析|抓取|试试)/,
+        /^让我先(?:看|查|检查|定位|确认|分析|抓取)/,
+        /^我先查看/,
+        /^我先看一下/,
+        /^I'll\s+(?:check|look|inspect|review|analyze|trace)\b/i,
+        /^Let\s+me\s+(?:check|look|inspect|review|analyze|trace)\b/i,
+        /^I\s+will\s+first\b/i,
+    ];
+
+    if (!planningLeadPatterns.some(p => p.test(trimmed))) return false;
+
+    // 长回复可能已经包含实际结果，不作为“只计划”处理。
+    return trimmed.length <= 260;
+}
+
+function isLikelyFinalAnswer(text: string): boolean {
+    const trimmed = (text || '').trim();
+    if (!trimmed) return false;
+    const finalPatterns: RegExp[] = [
+        /(?:已(?:完成|修复)|完成了|修复好了|处理完毕|结论|最终结果)/,
+        /(?:here(?:'s| is) the result|done|fixed|completed|final result)/i,
+    ];
+    return finalPatterns.some(p => p.test(trimmed));
+}
+
+function isShortNonActionResponse(text: string): boolean {
+    const trimmed = (text || '').trim();
+    if (!trimmed) return false;
+    if (hasToolCalls(trimmed)) return false;
+    if (isLikelyFinalAnswer(trimmed)) return false;
+    return trimmed.length <= 120;
+}
+
+function buildActionExecutionRetryRequest(body: AnthropicRequest, attempt: number): AnthropicRequest {
+    const toolNames = (body.tools ?? []).map(t => t.name).filter(Boolean).slice(0, 24);
+    const toolList = toolNames.length > 0 ? toolNames.join(', ') : 'the available tools';
+    const nudges = [
+        `Do not describe your plan. Execute the next concrete step right now. Your next reply MUST start with a tool call using the exact format below, with no prose before it. Available tools: ${toolList}\n\n\0\0\0json action\n{\n  \"tool\": \"ONE_OF_AVAILABLE_TOOLS\",\n  \"parameters\": {\n    \"key\": \"value\"\n  }\n}\n\0\0\0`,
+        `Stop planning. Output only one or more \`\`\`json action\`\`\` blocks now. No explanation, no summary, no apology. Choose the best next tool and execute it immediately. Available tools: ${toolList}`,
+        `You are still not executing. This is a hard requirement: output a real tool call now, using only the exact \`\`\`json action\`\`\` format. Do not say what you will do. Do it now. Available tools: ${toolList}`,
+        `FINAL WARNING: your next reply must be only a valid \`\`\`json action\`\`\` tool invocation for the next concrete step. No prose. No reasoning. No summary. Use one of: ${toolList}`,
+    ];
+    const nudge = nudges[Math.min(attempt, nudges.length - 1)].replace(/\u0006/g, '`');
+
+    const clonedMessages = body.messages.map(msg => {
+        const content = Array.isArray(msg.content)
+            ? msg.content.map(block => ({ ...block }))
+            : msg.content;
+        return { ...msg, content };
+    });
+
+    const newMessages: AnthropicMessage[] = [
+        ...clonedMessages,
+        { role: 'assistant', content: 'Understood. I will execute the next step using a tool call now.' },
+        { role: 'user', content: nudge },
+    ];
+
+    return {
+        ...body,
+        messages: newMessages,
+    };
 }
 
 // ==================== 请求转换：OpenAI → Anthropic ====================
@@ -1295,7 +1380,7 @@ function writeOpenAISSE(res: Response, data: OpenAIChatCompletionChunk): void {
  * 注意：与 Chat Completions 的 "data: {json}\n\n" 不同，Responses API 需要 event: 前缀
  */
 function writeResponsesSSE(res: Response, eventType: string, data: Record<string, unknown>): void {
-    res.write(`event: ${eventType}\ndata: ${JSON.stringify(data)}\n\n`);
+    res.write(`event: ${eventType}\ndata: ${JSON.stringify({ type: eventType, ...data })}\n\n`);
     if (typeof (res as unknown as { flush: () => void }).flush === 'function') {
         (res as unknown as { flush: () => void }).flush();
     }
@@ -1341,6 +1426,12 @@ export async function handleOpenAIResponses(req: Request, res: Response): Promis
     const body = req.body as Record<string, unknown>;
     const isStream = (body.stream as boolean) ?? true;
     const chatBody = responsesToChatCompletions(body);
+    // DEBUG: 打印转换后的消息
+    console.log(`[DEBUG-RSP] input type=${typeof body.input}, input length=${Array.isArray(body.input) ? (body.input as unknown[]).length : 'N/A'}, instructions=${!!(body.instructions)}`);
+    for (const m of chatBody.messages) {
+        const content = typeof m.content === 'string' ? m.content.slice(0, 200) : JSON.stringify(m.content)?.slice(0, 200);
+        console.log(`[DEBUG-RSP] msg role=${m.role} content=${content} tool_calls=${(m as unknown as Record<string, unknown>).tool_calls ? 'yes' : 'no'}`);
+    }
     const log = createRequestLogger({
         method: req.method,
         path: req.path,
@@ -1458,10 +1549,10 @@ function emitResponsesTextStream(
     const allOutputItems = toolCallItems ? [...toolCallItems, messageItem] : [messageItem];
 
     // 1. response.created
-    writeResponsesSSE(res, 'response.created', buildResponseObject(respId, model, 'in_progress', []));
+    writeResponsesSSE(res, 'response.created', { response: buildResponseObject(respId, model, 'in_progress', []) });
 
     // 2. response.in_progress
-    writeResponsesSSE(res, 'response.in_progress', buildResponseObject(respId, model, 'in_progress', []));
+    writeResponsesSSE(res, 'response.in_progress', { response: buildResponseObject(respId, model, 'in_progress', []) });
 
     // 3. 文本 output item
     writeResponsesSSE(res, 'response.output_item.added', {
@@ -1516,7 +1607,7 @@ function emitResponsesTextStream(
     });
 
     // 9. response.completed — ★ 这是 Codex 等待的关键事件
-    writeResponsesSSE(res, 'response.completed', buildResponseObject(respId, model, 'completed', allOutputItems, usage));
+    writeResponsesSSE(res, 'response.completed', { response: buildResponseObject(respId, model, 'completed', allOutputItems, usage) });
 }
 
 /**
@@ -1545,6 +1636,7 @@ async function handleResponsesStream(
     const model = (body.model as string) || 'gpt-4';
     const hasTools = (anthropicReq.tools?.length ?? 0) > 0;
     let toolCallsDetected = 0;
+    const actionRetryLimit = Math.max(MAX_REFUSAL_RETRIES, 4);
 
     // 缓冲完整响应再处理（复用 Chat Completions 的逻辑）
     let fullResponse = '';
@@ -1584,19 +1676,43 @@ async function handleResponsesStream(
             if (hasTools && hasToolCalls(fullResponse)) return false;
             return true;
         };
+        const shouldRetryPlanningOnly = () => hasTools && isPlanningOnlyNoAction(fullResponse);
+        const shouldRetryShortNonAction = () => hasTools && isShortNonActionResponse(fullResponse);
 
-        while (shouldRetryRefusal() && retryCount < MAX_REFUSAL_RETRIES) {
+        if (shouldRetryRefusal()) {
+            console.log(`[DEBUG-REFUSAL] hasTools=${hasTools}, response(200)=${fullResponse.slice(0, 200)}`);
+        }
+        if (shouldRetryPlanningOnly()) {
+            console.log(`[DEBUG-PLANONLY] hasTools=${hasTools}, response(200)=${fullResponse.slice(0, 200)}`);
+        }
+        if (shouldRetryShortNonAction()) {
+            console.log(`[DEBUG-SHORT-NOACTION] hasTools=${hasTools}, response(120)=${fullResponse.slice(0, 120)}`);
+        }
+
+        while ((shouldRetryRefusal() || shouldRetryPlanningOnly() || shouldRetryShortNonAction()) && retryCount < actionRetryLimit) {
             retryCount++;
-            const retryBody = buildRetryRequest(anthropicReq, retryCount - 1);
+            const retryForRefusal = shouldRetryRefusal();
+            const retryForPlanning = shouldRetryPlanningOnly();
+            const retryForShort = shouldRetryShortNonAction();
+            console.log(`[DEBUG-RETRY] retry #${retryCount}, refusal=${retryForRefusal}, planning_only=${retryForPlanning}, short_non_action=${retryForShort}, hasTools=${hasTools}`);
+            const retryBody = (retryForPlanning || retryForShort)
+                ? buildActionExecutionRetryRequest(anthropicReq, retryCount - 1)
+                : buildRetryRequest(anthropicReq, retryCount - 1);
             activeCursorReq = await convertToCursorRequest(retryBody);
             await executeStream();
             if (hasLeadingThinking(fullResponse)) {
                 fullResponse = extractThinking(fullResponse).strippedText;
             }
+            if (shouldRetryRefusal() || shouldRetryPlanningOnly() || shouldRetryShortNonAction()) {
+                console.log(`[DEBUG-RETRY] retry #${retryCount} still unresolved: ${fullResponse.slice(0, 200)}`);
+            }
         }
 
         if (shouldRetryRefusal()) {
-            if (isToolCapabilityQuestion(anthropicReq)) {
+            // ★ Agent 模式（有工具）：不替换为固定回复，传递实际响应让客户端处理
+            if (hasTools) {
+                console.log(`[DEBUG-REFUSAL] agent mode: passing through actual response instead of canned reply`);
+            } else if (isToolCapabilityQuestion(anthropicReq)) {
                 fullResponse = CLAUDE_TOOLS_RESPONSE;
             } else {
                 fullResponse = CLAUDE_IDENTITY_RESPONSE;
@@ -1624,8 +1740,8 @@ async function handleResponsesStream(
                 log.recordToolCalls(toolCalls);
                 log.updateSummary({ toolCallsDetected: toolCalls.length });
                 // 1. response.created + response.in_progress
-                writeResponsesSSE(res, 'response.created', buildResponseObject(respId, model, 'in_progress', []));
-                writeResponsesSSE(res, 'response.in_progress', buildResponseObject(respId, model, 'in_progress', []));
+                writeResponsesSSE(res, 'response.created', { response: buildResponseObject(respId, model, 'in_progress', []) });
+                writeResponsesSSE(res, 'response.in_progress', { response: buildResponseObject(respId, model, 'in_progress', []) });
 
                 const allOutputItems: Record<string, unknown>[] = [];
                 let outputIndex = 0;
@@ -1713,7 +1829,7 @@ async function handleResponsesStream(
                 }
 
                 // 4. response.completed — ★ Codex 等待的关键事件
-                writeResponsesSSE(res, 'response.completed', buildResponseObject(respId, model, 'completed', allOutputItems, usage));
+                writeResponsesSSE(res, 'response.completed', { response: buildResponseObject(respId, model, 'completed', allOutputItems, usage) });
             } else {
                 // 工具调用解析失败（误报）→ 作为纯文本发送
                 const msgItemId = responsesItemId();
@@ -1734,7 +1850,7 @@ async function handleResponsesStream(
         try {
             const errorText = `[Error: ${message}]`;
             const errorItemId = responsesItemId();
-            writeResponsesSSE(res, 'response.created', buildResponseObject(respId, model, 'in_progress', []));
+            writeResponsesSSE(res, 'response.created', { response: buildResponseObject(respId, model, 'in_progress', []) });
             writeResponsesSSE(res, 'response.output_item.added', {
                 output_index: 0,
                 item: { id: errorItemId, type: 'message', role: 'assistant', status: 'in_progress', content: [] },
@@ -1757,10 +1873,10 @@ async function handleResponsesStream(
                 output_index: 0,
                 item: { id: errorItemId, type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: errorText, annotations: [] }] },
             });
-            writeResponsesSSE(res, 'response.completed', buildResponseObject(respId, model, 'completed', [{
+            writeResponsesSSE(res, 'response.completed', { response: buildResponseObject(respId, model, 'completed', [{
                 id: errorItemId, type: 'message', role: 'assistant', status: 'completed',
                 content: [{ type: 'output_text', text: errorText, annotations: [] }],
-            }], { input_tokens: 0, output_tokens: 10, total_tokens: 10 }));
+            }], { input_tokens: 0, output_tokens: 10, total_tokens: 10 }) });
         } catch { /* ignore double error */ }
     } finally {
         clearInterval(keepaliveInterval);
@@ -1782,6 +1898,7 @@ async function handleResponsesNonStream(
     let activeCursorReq = cursorReq;
     let fullText = (await sendCursorRequestFull(activeCursorReq)).text;
     const hasTools = (anthropicReq.tools?.length ?? 0) > 0;
+    const actionRetryLimit = Math.max(MAX_REFUSAL_RETRIES, 4);
 
     // Thinking 提取
     if (hasLeadingThinking(fullText)) {
@@ -1790,19 +1907,31 @@ async function handleResponsesNonStream(
 
     // 拒绝检测 + 重试
     const shouldRetry = () => isRefusal(fullText) && !(hasTools && hasToolCalls(fullText));
-    if (shouldRetry()) {
-        for (let attempt = 0; attempt < MAX_REFUSAL_RETRIES; attempt++) {
-            const retryBody = buildRetryRequest(anthropicReq, attempt);
+    const shouldRetryPlanningOnly = () => hasTools && isPlanningOnlyNoAction(fullText);
+    const shouldRetryShortNonAction = () => hasTools && isShortNonActionResponse(fullText);
+    if (shouldRetry() || shouldRetryPlanningOnly() || shouldRetryShortNonAction()) {
+        console.log(`[DEBUG-REFUSAL-NS] hasTools=${hasTools}, response(200)=${fullText.slice(0, 200)}`);
+        for (let attempt = 0; attempt < actionRetryLimit; attempt++) {
+            const retryForRefusal = shouldRetry();
+            const retryForPlanning = shouldRetryPlanningOnly();
+            const retryForShort = shouldRetryShortNonAction();
+            console.log(`[DEBUG-RETRY-NS] retry #${attempt + 1}, refusal=${retryForRefusal}, planning_only=${retryForPlanning}, short_non_action=${retryForShort}, hasTools=${hasTools}`);
+            const retryBody = (retryForPlanning || retryForShort)
+                ? buildActionExecutionRetryRequest(anthropicReq, attempt)
+                : buildRetryRequest(anthropicReq, attempt);
             const retryCursorReq = await convertToCursorRequest(retryBody);
             activeCursorReq = retryCursorReq;
             fullText = (await sendCursorRequestFull(activeCursorReq)).text;
             if (hasLeadingThinking(fullText)) {
                 fullText = extractThinking(fullText).strippedText;
             }
-            if (!shouldRetry()) break;
+            if (!shouldRetry() && !shouldRetryPlanningOnly() && !shouldRetryShortNonAction()) break;
         }
         if (shouldRetry()) {
-            if (isToolCapabilityQuestion(anthropicReq)) {
+            // ★ Agent 模式（有工具）：不替换为固定回复
+            if (hasTools) {
+                console.log(`[DEBUG-REFUSAL-NS] agent mode: passing through actual response`);
+            } else if (isToolCapabilityQuestion(anthropicReq)) {
                 fullText = CLAUDE_TOOLS_RESPONSE;
             } else {
                 fullText = CLAUDE_IDENTITY_RESPONSE;
@@ -1874,10 +2003,15 @@ async function handleResponsesNonStream(
  */
 export function responsesToChatCompletions(body: Record<string, unknown>): OpenAIChatRequest {
     const messages: OpenAIMessage[] = [];
+    const isMeaningfulString = (v: unknown): v is string => typeof v === 'string' && v.trim().length > 0;
+    const MAX_RESPONSES_SYSTEM_MESSAGES = 3;
+    const MAX_RESPONSES_NON_SYSTEM_MESSAGES = 220;
 
     // 系统指令
     if (body.instructions && typeof body.instructions === 'string') {
-        messages.push({ role: 'system', content: body.instructions });
+        if (isMeaningfulString(body.instructions)) {
+            messages.push({ role: 'system', content: body.instructions });
+        }
     }
 
     // 转换 input
@@ -1901,7 +2035,9 @@ export function responsesToChatCompletions(body: Record<string, unknown>): OpenA
                     role: 'system',
                     content: (item.content as string | OpenAIContentPart[] | null) ?? null,
                 } as OpenAIMessage);
-                messages.push({ role: 'system', content: text });
+                if (isMeaningfulString(text)) {
+                    messages.push({ role: 'system', content: text });
+                }
             } else if (role === 'user') {
                 const rawContent = (item.content as string | OpenAIContentPart[] | null) ?? null;
                 const normalizedContent = typeof rawContent === 'string'
@@ -1909,10 +2045,18 @@ export function responsesToChatCompletions(body: Record<string, unknown>): OpenA
                     : Array.isArray(rawContent) && rawContent.every(b => b.type === 'input_text')
                         ? rawContent.map(b => b.text || '').join('\n')
                         : rawContent;
-                messages.push({
-                    role: 'user',
-                    content: normalizedContent || '',
-                });
+                const hasNonEmptyArrayContent = Array.isArray(normalizedContent)
+                    && normalizedContent.some(b => {
+                        const part = b as unknown as Record<string, unknown>;
+                        return typeof part.text === 'string' ? part.text.trim().length > 0 : true;
+                    });
+                const hasUserContent = isMeaningfulString(normalizedContent) || hasNonEmptyArrayContent;
+                if (hasUserContent) {
+                    messages.push({
+                        role: 'user',
+                        content: normalizedContent || '',
+                    });
+                }
             } else if (role === 'assistant') {
                 const blocks = Array.isArray(item.content) ? item.content as Array<Record<string, unknown>> : [];
                 const text = blocks.filter(b => b.type === 'output_text').map(b => b.text as string).join('\n');
@@ -1926,11 +2070,13 @@ export function responsesToChatCompletions(body: Record<string, unknown>): OpenA
                         arguments: (b.arguments as string) || '{}',
                     },
                 }));
-                messages.push({
-                    role: 'assistant',
-                    content: text || null,
-                    ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
-                });
+                if (isMeaningfulString(text) || toolCalls.length > 0) {
+                    messages.push({
+                        role: 'assistant',
+                        content: isMeaningfulString(text) ? text : null,
+                        ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
+                    });
+                }
             }
         }
     }
@@ -1959,9 +2105,31 @@ export function responsesToChatCompletions(body: Record<string, unknown>): OpenA
         })
         : undefined;
 
+    // ★ Responses 路径历史硬裁剪：防止客户端携带超长历史导致模型退化
+    // 经验上只保留最近系统提示 + 最近对话即可稳定工具调用。
+    const systemMsgs = messages.filter(m => m.role === 'system');
+    const nonSystemMsgs = messages.filter(m => m.role !== 'system');
+
+    // 保留关键 system 提示词（如 Codex 角色/权限提示）避免长对话中被误裁剪。
+    const criticalSystemMsgs = systemMsgs.filter(m => {
+        const content = stringifyUnknownContent(m.content);
+        return isCriticalResponsesSystemPrompt(content);
+    });
+    const criticalSystemSet = new Set(criticalSystemMsgs);
+    const nonCriticalSystemMsgs = systemMsgs.filter(m => !criticalSystemSet.has(m));
+    const keptNonCriticalSystemSet = new Set(nonCriticalSystemMsgs.slice(-MAX_RESPONSES_SYSTEM_MESSAGES));
+    const trimmedSystemMsgs = systemMsgs.filter(m => criticalSystemSet.has(m) || keptNonCriticalSystemSet.has(m));
+
+    const trimmedNonSystemMsgs = nonSystemMsgs.slice(-MAX_RESPONSES_NON_SYSTEM_MESSAGES);
+    const finalMessages = [...trimmedSystemMsgs, ...trimmedNonSystemMsgs];
+
+    if (finalMessages.length < messages.length) {
+        console.log(`[DEBUG-RSP] hard trim messages: ${messages.length} -> ${finalMessages.length} (system kept=${trimmedSystemMsgs.length}, critical_system=${criticalSystemMsgs.length})`);
+    }
+
     return {
         model: (body.model as string) || 'gpt-4',
-        messages,
+        messages: finalMessages,
         stream: (body.stream as boolean) ?? true,
         temperature: body.temperature as number | undefined,
         max_tokens: (body.max_output_tokens as number) || 8192,

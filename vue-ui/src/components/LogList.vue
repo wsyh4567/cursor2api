@@ -79,7 +79,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, watch, nextTick } from 'vue';
+import { ref, computed, watch, nextTick, onUnmounted } from 'vue';
 import { useLogsStore } from '../stores/logs';
 import type { LogPhase } from '../types';
 import hljs from 'highlight.js/lib/core';
@@ -114,6 +114,16 @@ function phaseColor(phase: LogPhase): string {
   return PC[phase] ?? '#94a3b8';
 }
 
+// O(1) 查找：用 computed Map 替代模板内 O(n) find/findIndex
+const reqInfoMap = computed(() => {
+  const map = new Map<string, { title: string; seq: number }>();
+  const list = logsStore.reqs;
+  for (let i = 0; i < list.length; i++) {
+    map.set(list[i].requestId, { title: list[i].title ?? '', seq: list.length - i });
+  }
+  return map;
+});
+
 const filtered = computed(() => {
   let logs = logsStore.displayLogs;
   if (levelFilter.value !== 'all') logs = logs.filter(l => l.level === levelFilter.value);
@@ -123,8 +133,16 @@ const filtered = computed(() => {
     l.message.toLowerCase().includes(q) ||
     (l.source ?? '').toLowerCase().includes(q) ||
     l.phase.toLowerCase().includes(q) ||
-    reqTitle(l.requestId).toLowerCase().includes(q)
+    (reqInfoMap.value.get(l.requestId)?.title ?? '').toLowerCase().includes(q)
   );
+});
+
+// 缓存搜索 RegExp，避免每次渲染 v-html 时重建
+const _hlRegex = computed<RegExp | null>(() => {
+  const q = logSearch.value.trim();
+  if (!q) return null;
+  const escapedQ = escHtml(q).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(escapedQ, 'gi');
 });
 
 function escHtml(s: string): string {
@@ -132,20 +150,19 @@ function escHtml(s: string): string {
 }
 
 function hlMsg(msg: string): string {
-  const q = logSearch.value.trim();
-  if (!q) return escHtml(msg);
+  const re = _hlRegex.value;
+  if (!re) return escHtml(msg);
   const escaped = escHtml(msg);
-  const escapedQ = escHtml(q).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  return escaped.replace(new RegExp(escapedQ, 'gi'), m => `<mark class="lhl">${m}</mark>`);
+  re.lastIndex = 0;
+  return escaped.replace(re, m => `<mark class="lhl">${m}</mark>`);
 }
 
 function reqTitle(requestId: string): string {
-  return logsStore.reqs.find(r => r.requestId === requestId)?.title ?? '';
+  return reqInfoMap.value.get(requestId)?.title ?? '';
 }
 
 function seqNum(requestId: string): number {
-  const idx = logsStore.reqs.findIndex(r => r.requestId === requestId);
-  return idx < 0 ? 0 : logsStore.reqs.length - idx;
+  return reqInfoMap.value.get(requestId)?.seq ?? 0;
 }
 
 function fmtMs(ms: number): string {
@@ -185,6 +202,17 @@ function onAutoExpand() {
   }
 }
 
+// 节流滚动到底：高频 SSE 下防止每条日志都触发一次 scrollHeight 读取（强制重排）
+let _scrollRaf = 0;
+function scheduleScrollBottom() {
+  if (_scrollRaf) return;
+  _scrollRaf = requestAnimationFrame(() => {
+    _scrollRaf = 0;
+    if (listEl.value) listEl.value.scrollTop = listEl.value.scrollHeight;
+  });
+}
+onUnmounted(() => { if (_scrollRaf) cancelAnimationFrame(_scrollRaf); });
+
 // 新日志进来时若 autoExpand 开启则自动展开
 watch(() => filtered.value.length, async () => {
   if (autoExpand.value) {
@@ -195,7 +223,7 @@ watch(() => filtered.value.length, async () => {
     expanded.value = next;
   }
   await nextTick();
-  if (listEl.value) listEl.value.scrollTop = listEl.value.scrollHeight;
+  scheduleScrollBottom();
 }, { flush: 'post' });
 
 async function copy(text: string) {
